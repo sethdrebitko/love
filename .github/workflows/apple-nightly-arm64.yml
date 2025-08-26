@@ -1,0 +1,283 @@
+name: Apple Nightly (arm64 only)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # Nightly at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch or tag to build (default: 12.x)"
+        required: false
+        default: "12.x"
+      ios_export_method:
+        description: "iOS export method: ad-hoc, development, or app-store"
+        required: false
+        default: "ad-hoc"
+      ios_bundle_id:
+        description: "Override iOS bundle identifier (optional; else uses secret IOS_BUNDLE_ID)"
+        required: false
+        default: ""
+
+env:
+  TARGET_REF: ${{ github.event.inputs.target_ref || '12.x' }}
+
+concurrency:
+  group: apple-nightly-arm64-${{ github.workflow }}-${{ github.ref || env.TARGET_REF }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS app (arm64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_REF }}
+          submodules: recursive
+
+      - name: Fetch Apple dependencies
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/love2d/love-apple-dependencies.git deps
+          mkdir -p platform/xcode
+          rm -rf platform/xcode/shared || true
+          ln -s "$PWD/deps/shared" platform/xcode/shared
+          mkdir -p platform/xcode/macosx
+          rm -rf platform/xcode/macosx/Frameworks || true
+          ln -s "$PWD/deps/macOS/Frameworks" platform/xcode/macosx/Frameworks
+
+      - name: Build macOS app (unsigned, arm64)
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project platform/xcode/love.xcodeproj \
+            -scheme love-macosx \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath build-macos \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      - name: Zip macOS app
+        run: |
+          APP="build-macos/Build/Products/Release/love.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "love-macos-arm64-${{ github.sha }}.zip"
+
+      - name: Upload macOS artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: love-macos-arm64-${{ env.TARGET_REF }}-${{ github.sha }}
+          path: love-macos-arm64-${{ github.sha }}.zip
+          if-no-files-found: error
+
+      # Optional signing + notarization (provide secrets to enable)
+      - name: Import macOS Developer ID cert (optional)
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 && secrets.MACOS_CERT_PASSWORD }}
+        env:
+          P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euxo pipefail
+          echo "$P12_BASE64" | base64 --decode > dev_id.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import dev_id.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Sign macOS app (optional)
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 && secrets.MACOS_CERT_PASSWORD && secrets.MACOS_SIGNING_IDENTITY }}
+        env:
+          SIGN_ID: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euxo pipefail
+          APP="build-macos/Build/Products/Release/love.app"
+          /usr/bin/codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "love-macos-arm64-signed-${{ github.sha }}.zip"
+
+      - name: Notarize macOS app (optional)
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 && secrets.MACOS_CERT_PASSWORD && secrets.MACOS_SIGNING_IDENTITY && secrets.APPLE_NOTARY_KEY_ID && secrets.APPLE_NOTARY_ISSUER_ID && secrets.APPLE_NOTARY_PRIVATE_KEY_BASE64 }}
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_B64: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euxo pipefail
+          echo "$NOTARY_KEY_B64" | base64 --decode > notary_key.p8
+          xcrun notarytool submit "love-macos-arm64-signed-${{ github.sha }}.zip" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --key notary_key.p8 \
+            --wait
+          unzip -q "love-macos-arm64-signed-${{ github.sha }}.zip" -d stapling
+          xcrun stapler staple "stapling/love.app"
+          ditto -c -k --sequesterRsrc --keepParent "stapling/love.app" "love-macos-arm64-notarized-${{ github.sha }}.zip"
+
+      - name: Upload macOS signed/notarized artifact (optional)
+        if: ${{ always() && (secrets.MACOS_CERT_P12_BASE64 && secrets.MACOS_CERT_PASSWORD && secrets.MACOS_SIGNING_IDENTITY) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: love-macos-arm64-signed-${{ env.TARGET_REF }}-${{ github.sha }}
+          path: |
+            love-macos-arm64-signed-${{ github.sha }}.zip
+            love-macos-arm64-notarized-${{ github.sha }}.zip
+          if-no-files-found: ignore
+
+  ios-sim:
+    name: iOS Simulator app (arm64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_REF }}
+          submodules: recursive
+
+      - name: Fetch Apple dependencies
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/love2d/love-apple-dependencies.git deps
+          mkdir -p platform/xcode
+          rm -rf platform/xcode/shared || true
+          ln -s "$PWD/deps/shared" platform/xcode/shared
+          mkdir -p platform/xcode/ios
+          rm -rf platform/xcode/ios/libraries || true
+          ln -s "$PWD/deps/iOS/libraries" platform/xcode/ios/libraries
+
+      - name: Build iOS Simulator .app (unsigned, arm64)
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project platform/xcode/love.xcodeproj \
+            -scheme love-ios \
+            -configuration Release \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath build-ios-sim \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Zip iOS Simulator app
+        run: |
+          APP="build-ios-sim/Build/Products/Release-iphonesimulator/love.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "love-ios-simulator-arm64-${{ github.sha }}.zip"
+
+      - name: Upload iOS Simulator artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: love-ios-simulator-arm64-${{ env.TARGET_REF }}-${{ github.sha }}
+          path: love-ios-simulator-arm64-${{ github.sha }}.zip
+          if-no-files-found: error
+
+  ios-ipa:
+    name: iOS .ipa (device, arm64)
+    runs-on: macos-14
+    env:
+      IOS_BUNDLE_ID: ${{ github.event.inputs.ios_bundle_id || secrets.IOS_BUNDLE_ID }}
+    if: ${{ secrets.IOS_CERT_P12_BASE64 && secrets.IOS_CERT_PASSWORD && secrets.IOS_PROVISIONING_PROFILE_BASE64 && secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euxo pipefail
+          if [ -z "${IOS_BUNDLE_ID}" ]; then
+            echo "IOS_BUNDLE_ID is required (set as input or secret)."; exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_REF }}
+          submodules: recursive
+
+      - name: Fetch Apple dependencies
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/love2d/love-apple-dependencies.git deps
+          mkdir -p platform/xcode
+          rm -rf platform/xcode/shared || true
+          ln -s "$PWD/deps/shared" platform/xcode/shared
+          mkdir -p platform/xcode/ios
+          rm -rf platform/xcode/ios/libraries || true
+          ln -s "$PWD/deps/iOS/libraries" platform/xcode/ios/libraries
+
+      - name: Import iOS signing certificate
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.IOS_CERT_PASSWORD }}
+
+      - name: Install provisioning profile
+        env:
+          PROFILE_B64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$PROFILE_B64" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/profile.mobileprovision"
+          security cms -D -i "$HOME/Library/MobileDevice/Provisioning Profiles/profile.mobileprovision" > profile.plist
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' profile.plist)
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' profile.plist)
+          echo "IOS_PROFILE_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "IOS_PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+
+      - name: Archive for iOS (device, arm64)
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euxo pipefail
+          xcodebuild archive \
+            -project platform/xcode/love.xcodeproj \
+            -scheme love-ios \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build-ios/love.xcarchive \
+            PRODUCT_BUNDLE_IDENTIFIER="${IOS_BUNDLE_ID}" \
+            DEVELOPMENT_TEAM="${TEAM_ID}" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="${IOS_PROFILE_NAME}" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO
+
+      - name: Create export options
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPORT_METHOD: ${{ github.event.inputs.ios_export_method || 'ad-hoc' }}
+        run: |
+          set -euxo pipefail
+          cat > exportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${IOS_BUNDLE_ID}</key><string>${IOS_PROFILE_NAME}</string>
+            </dict>
+            <key>stripSwiftSymbols</key><true/>
+            <key>compileBitcode</key><false/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Export .ipa
+        run: |
+          set -euxo pipefail
+          xcodebuild -exportArchive \
+            -archivePath build-ios/love.xcarchive \
+            -exportOptionsPlist exportOptions.plist \
+            -exportPath export-ios
+          IPA=$(echo export-ios/*.ipa)
+          mv "$IPA" "love-ios-arm64-${{ github.sha }}.ipa"
+
+      - name: Upload iOS .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: love-ios-arm64-ipa-${{ env.TARGET_REF }}-${{ github.sha }}
+          path: love-ios-arm64-${{ github.sha }}.ipa
+          if-no-files-found: error
